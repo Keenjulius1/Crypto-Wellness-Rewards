@@ -7,6 +7,11 @@
 (define-constant ERR-INVALID-ACTIVITY (err u105))
 (define-constant ERR-DAILY-LIMIT-REACHED (err u106))
 (define-constant ERR-GOAL-NOT-MET (err u107))
+(define-constant ERR-ACHIEVEMENT-NOT-FOUND (err u108))
+(define-constant ERR-MARKETPLACE-LISTING-EXISTS (err u109))
+(define-constant ERR-MARKETPLACE-LISTING-NOT-FOUND (err u110))
+(define-constant ERR-INSUFFICIENT-FUNDS (err u111))
+(define-constant ERR-CANNOT-BUY-OWN-LISTING (err u112))
 
 (define-constant REWARD-TOKEN-NAME "Wellness Token")
 (define-constant REWARD-TOKEN-SYMBOL "WELL")
@@ -21,8 +26,10 @@
 (define-constant STREAK-BONUS u75000000)
 
 (define-fungible-token wellness-token REWARD-TOKEN-SUPPLY)
+(define-non-fungible-token wellness-achievement uint)
 
 (define-data-var token-uri (optional (string-utf8 256)) none)
+(define-data-var achievement-counter uint u0)
 (define-data-var total-users uint u0)
 (define-data-var total-rewards-distributed uint u0)
 
@@ -70,6 +77,28 @@
         user: principal,
         total-points: uint,
         rank: uint,
+    }
+)
+
+(define-map achievements
+    uint
+    {
+        name: (string-ascii 50),
+        description: (string-ascii 200),
+        rarity: uint,
+        requirement-type: (string-ascii 20),
+        requirement-value: uint,
+        owner: principal,
+    }
+)
+
+(define-map marketplace-listings
+    uint
+    {
+        achievement-id: uint,
+        seller: principal,
+        price: uint,
+        active: bool,
     }
 )
 
@@ -402,3 +431,141 @@
     steps-reward: DAILY-STEPS-REWARD,
     exercise-reward: DAILY-EXERCISE-REWARD,
 })
+
+(define-public (mint-achievement
+        (name (string-ascii 50))
+        (description (string-ascii 200))
+        (rarity uint)
+        (requirement-type (string-ascii 20))
+        (requirement-value uint)
+        (recipient principal)
+    )
+    (let ((achievement-id (+ (var-get achievement-counter) u1)))
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+        (asserts! (>= rarity u1) ERR-INVALID-AMOUNT)
+        (asserts! (<= rarity u5) ERR-INVALID-AMOUNT)
+
+        (try! (nft-mint? wellness-achievement achievement-id recipient))
+
+        (map-set achievements achievement-id {
+            name: name,
+            description: description,
+            rarity: rarity,
+            requirement-type: requirement-type,
+            requirement-value: requirement-value,
+            owner: recipient,
+        })
+
+        (var-set achievement-counter achievement-id)
+        (ok achievement-id)
+    )
+)
+
+(define-public (transfer-achievement
+        (achievement-id uint)
+        (sender principal)
+        (recipient principal)
+    )
+    (begin
+        (asserts!
+            (is-eq (nft-get-owner? wellness-achievement achievement-id)
+                (some sender)
+            )
+            ERR-NOT-FOUND
+        )
+        (asserts! (or (is-eq tx-sender sender) (is-eq tx-sender CONTRACT-OWNER))
+            ERR-OWNER-ONLY
+        )
+
+        (try! (nft-transfer? wellness-achievement achievement-id sender recipient))
+
+        (match (map-get? achievements achievement-id)
+            achievement-data (map-set achievements achievement-id
+                (merge achievement-data { owner: recipient })
+            )
+            false
+        )
+        (ok true)
+    )
+)
+
+(define-public (list-achievement-for-sale
+        (achievement-id uint)
+        (price uint)
+    )
+    (let ((achievement-data (unwrap! (map-get? achievements achievement-id) ERR-ACHIEVEMENT-NOT-FOUND)))
+        (asserts! (is-eq (get owner achievement-data) tx-sender) ERR-OWNER-ONLY)
+        (asserts! (> price u0) ERR-INVALID-AMOUNT)
+        (asserts! (is-none (map-get? marketplace-listings achievement-id))
+            ERR-MARKETPLACE-LISTING-EXISTS
+        )
+
+        (map-set marketplace-listings achievement-id {
+            achievement-id: achievement-id,
+            seller: tx-sender,
+            price: price,
+            active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (buy-achievement (achievement-id uint))
+    (let (
+            (listing (unwrap! (map-get? marketplace-listings achievement-id)
+                ERR-MARKETPLACE-LISTING-NOT-FOUND
+            ))
+            (achievement-data (unwrap! (map-get? achievements achievement-id)
+                ERR-ACHIEVEMENT-NOT-FOUND
+            ))
+        )
+        (asserts! (get active listing) ERR-MARKETPLACE-LISTING-NOT-FOUND)
+        (asserts! (not (is-eq tx-sender (get seller listing)))
+            ERR-CANNOT-BUY-OWN-LISTING
+        )
+        (asserts!
+            (>= (ft-get-balance wellness-token tx-sender) (get price listing))
+            ERR-INSUFFICIENT-FUNDS
+        )
+
+        (try! (ft-transfer? wellness-token (get price listing) tx-sender
+            (get seller listing)
+        ))
+        (try! (nft-transfer? wellness-achievement achievement-id (get seller listing)
+            tx-sender
+        ))
+
+        (map-set achievements achievement-id
+            (merge achievement-data { owner: tx-sender })
+        )
+
+        (map-delete marketplace-listings achievement-id)
+        (ok true)
+    )
+)
+
+(define-public (cancel-listing (achievement-id uint))
+    (let ((listing (unwrap! (map-get? marketplace-listings achievement-id)
+            ERR-MARKETPLACE-LISTING-NOT-FOUND
+        )))
+        (asserts! (is-eq tx-sender (get seller listing)) ERR-OWNER-ONLY)
+        (map-delete marketplace-listings achievement-id)
+        (ok true)
+    )
+)
+
+(define-read-only (get-achievement (achievement-id uint))
+    (map-get? achievements achievement-id)
+)
+
+(define-read-only (get-marketplace-listing (achievement-id uint))
+    (map-get? marketplace-listings achievement-id)
+)
+
+(define-read-only (get-achievement-owner (achievement-id uint))
+    (nft-get-owner? wellness-achievement achievement-id)
+)
+
+(define-read-only (get-achievement-counter)
+    (var-get achievement-counter)
+)
