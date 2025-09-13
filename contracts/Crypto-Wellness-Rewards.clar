@@ -12,6 +12,13 @@
 (define-constant ERR-MARKETPLACE-LISTING-NOT-FOUND (err u110))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u111))
 (define-constant ERR-CANNOT-BUY-OWN-LISTING (err u112))
+(define-constant ERR-PLAN-NOT-FOUND (err u113))
+(define-constant ERR-PLAN-NOT-ACTIVE (err u114))
+(define-constant ERR-PLAN-ALREADY-ENROLLED (err u115))
+(define-constant ERR-PLAN-NOT-ENROLLED (err u116))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u117))
+(define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u118))
+(define-constant ERR-INVALID-PLAN-DURATION (err u119))
 
 (define-constant REWARD-TOKEN-NAME "Wellness Token")
 (define-constant REWARD-TOKEN-SYMBOL "WELL")
@@ -32,6 +39,8 @@
 (define-data-var achievement-counter uint u0)
 (define-data-var total-users uint u0)
 (define-data-var total-rewards-distributed uint u0)
+(define-data-var wellness-plan-counter uint u0)
+(define-data-var total-plans-completed uint u0)
 
 (define-map user-profiles
     principal
@@ -99,6 +108,53 @@
         seller: principal,
         price: uint,
         active: bool,
+    }
+)
+
+(define-map wellness-plans
+    uint
+    {
+        name: (string-ascii 100),
+        description: (string-ascii 300),
+        creator: principal,
+        duration-days: uint,
+        daily-steps-target: uint,
+        daily-exercise-target: uint,
+        completion-reward: uint,
+        milestone-reward: uint,
+        price: uint,
+        active: bool,
+        total-enrolled: uint,
+        total-completed: uint,
+    }
+)
+
+(define-map user-plan-enrollments
+    {
+        user: principal,
+        plan-id: uint,
+    }
+    {
+        start-day: uint,
+        progress-days: uint,
+        milestones-completed: uint,
+        total-rewards-earned: uint,
+        completed: bool,
+        completion-day: (optional uint),
+    }
+)
+
+(define-map plan-daily-progress
+    {
+        user: principal,
+        plan-id: uint,
+        day: uint,
+    }
+    {
+        steps-achieved: uint,
+        exercise-achieved: uint,
+        goal-met: bool,
+        milestone-claimed: bool,
     }
 )
 
@@ -568,4 +624,276 @@
 
 (define-read-only (get-achievement-counter)
     (var-get achievement-counter)
+)
+
+(define-public (create-wellness-plan
+        (name (string-ascii 100))
+        (description (string-ascii 300))
+        (duration-days uint)
+        (daily-steps-target uint)
+        (daily-exercise-target uint)
+        (completion-reward uint)
+        (milestone-reward uint)
+        (price uint)
+    )
+    (let ((plan-id (+ (var-get wellness-plan-counter) u1)))
+        (asserts! (> duration-days u0) ERR-INVALID-PLAN-DURATION)
+        (asserts! (<= duration-days u365) ERR-INVALID-PLAN-DURATION)
+        (asserts! (> daily-steps-target u0) ERR-INVALID-ACTIVITY)
+        (asserts! (> daily-exercise-target u0) ERR-INVALID-ACTIVITY)
+        (asserts! (> completion-reward u0) ERR-INVALID-AMOUNT)
+        (asserts! (> milestone-reward u0) ERR-INVALID-AMOUNT)
+
+        (map-set wellness-plans plan-id {
+            name: name,
+            description: description,
+            creator: tx-sender,
+            duration-days: duration-days,
+            daily-steps-target: daily-steps-target,
+            daily-exercise-target: daily-exercise-target,
+            completion-reward: completion-reward,
+            milestone-reward: milestone-reward,
+            price: price,
+            active: true,
+            total-enrolled: u0,
+            total-completed: u0,
+        })
+
+        (var-set wellness-plan-counter plan-id)
+        (ok plan-id)
+    )
+)
+
+(define-public (enroll-in-wellness-plan (plan-id uint))
+    (let (
+            (plan (unwrap! (map-get? wellness-plans plan-id) ERR-PLAN-NOT-FOUND))
+            (current-day (get-current-day))
+        )
+        (asserts! (get active plan) ERR-PLAN-NOT-ACTIVE)
+        (asserts!
+            (is-none (map-get? user-plan-enrollments {
+                user: tx-sender,
+                plan-id: plan-id,
+            }))
+            ERR-PLAN-ALREADY-ENROLLED
+        )
+        (asserts! (>= (ft-get-balance wellness-token tx-sender) (get price plan))
+            ERR-INSUFFICIENT-FUNDS
+        )
+
+        (try! (ft-transfer? wellness-token (get price plan) tx-sender
+            (get creator plan)
+        ))
+
+        (map-set user-plan-enrollments {
+            user: tx-sender,
+            plan-id: plan-id,
+        } {
+            start-day: current-day,
+            progress-days: u0,
+            milestones-completed: u0,
+            total-rewards-earned: u0,
+            completed: false,
+            completion-day: none,
+        })
+
+        (map-set wellness-plans plan-id
+            (merge plan { total-enrolled: (+ (get total-enrolled plan) u1) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (log-plan-progress
+        (plan-id uint)
+        (steps uint)
+        (exercise-minutes uint)
+    )
+    (let (
+            (plan (unwrap! (map-get? wellness-plans plan-id) ERR-PLAN-NOT-FOUND))
+            (enrollment (unwrap!
+                (map-get? user-plan-enrollments {
+                    user: tx-sender,
+                    plan-id: plan-id,
+                })
+                ERR-PLAN-NOT-ENROLLED
+            ))
+            (current-day (get-current-day))
+            (progress-day (+ (- current-day (get start-day enrollment)) u1))
+        )
+        (asserts! (not (get completed enrollment)) ERR-PLAN-NOT-ACTIVE)
+        (asserts! (<= progress-day (get duration-days plan)) ERR-PLAN-NOT-ACTIVE)
+        (asserts! (> steps u0) ERR-INVALID-ACTIVITY)
+        (asserts!
+            (is-none (map-get? plan-daily-progress {
+                user: tx-sender,
+                plan-id: plan-id,
+                day: progress-day,
+            }))
+            ERR-DAILY-LIMIT-REACHED
+        )
+
+        (let (
+                (steps-goal-met (>= steps (get daily-steps-target plan)))
+                (exercise-goal-met (>= exercise-minutes (get daily-exercise-target plan)))
+                (daily-goal-met (and steps-goal-met exercise-goal-met))
+            )
+            (map-set plan-daily-progress {
+                user: tx-sender,
+                plan-id: plan-id,
+                day: progress-day,
+            } {
+                steps-achieved: steps,
+                exercise-achieved: exercise-minutes,
+                goal-met: daily-goal-met,
+                milestone-claimed: false,
+            })
+
+            (map-set user-plan-enrollments {
+                user: tx-sender,
+                plan-id: plan-id,
+            }
+                (merge enrollment { progress-days: progress-day })
+            )
+            (ok daily-goal-met)
+        )
+    )
+)
+
+(define-public (claim-milestone-reward
+        (plan-id uint)
+        (milestone-day uint)
+    )
+    (let (
+            (plan (unwrap! (map-get? wellness-plans plan-id) ERR-PLAN-NOT-FOUND))
+            (enrollment (unwrap!
+                (map-get? user-plan-enrollments {
+                    user: tx-sender,
+                    plan-id: plan-id,
+                })
+                ERR-PLAN-NOT-ENROLLED
+            ))
+            (daily-progress (unwrap!
+                (map-get? plan-daily-progress {
+                    user: tx-sender,
+                    plan-id: plan-id,
+                    day: milestone-day,
+                })
+                ERR-MILESTONE-NOT-FOUND
+            ))
+        )
+        (asserts! (get goal-met daily-progress) ERR-GOAL-NOT-MET)
+        (asserts! (not (get milestone-claimed daily-progress))
+            ERR-MILESTONE-ALREADY-COMPLETED
+        )
+        (asserts! (<= milestone-day (get progress-days enrollment))
+            ERR-MILESTONE-NOT-FOUND
+        )
+
+        (try! (ft-mint? wellness-token (get milestone-reward plan) tx-sender))
+
+        (map-set plan-daily-progress {
+            user: tx-sender,
+            plan-id: plan-id,
+            day: milestone-day,
+        }
+            (merge daily-progress { milestone-claimed: true })
+        )
+
+        (map-set user-plan-enrollments {
+            user: tx-sender,
+            plan-id: plan-id,
+        }
+            (merge enrollment {
+                milestones-completed: (+ (get milestones-completed enrollment) u1),
+                total-rewards-earned: (+ (get total-rewards-earned enrollment)
+                    (get milestone-reward plan)
+                ),
+            })
+        )
+
+        (var-set total-rewards-distributed
+            (+ (var-get total-rewards-distributed) (get milestone-reward plan))
+        )
+        (ok (get milestone-reward plan))
+    )
+)
+
+(define-public (complete-wellness-plan (plan-id uint))
+    (let (
+            (plan (unwrap! (map-get? wellness-plans plan-id) ERR-PLAN-NOT-FOUND))
+            (enrollment (unwrap!
+                (map-get? user-plan-enrollments {
+                    user: tx-sender,
+                    plan-id: plan-id,
+                })
+                ERR-PLAN-NOT-ENROLLED
+            ))
+            (current-day (get-current-day))
+        )
+        (asserts! (not (get completed enrollment))
+            ERR-MILESTONE-ALREADY-COMPLETED
+        )
+        (asserts! (>= (get progress-days enrollment) (get duration-days plan))
+            ERR-GOAL-NOT-MET
+        )
+
+        (try! (ft-mint? wellness-token (get completion-reward plan) tx-sender))
+
+        (map-set user-plan-enrollments {
+            user: tx-sender,
+            plan-id: plan-id,
+        }
+            (merge enrollment {
+                completed: true,
+                completion-day: (some current-day),
+                total-rewards-earned: (+ (get total-rewards-earned enrollment)
+                    (get completion-reward plan)
+                ),
+            })
+        )
+
+        (map-set wellness-plans plan-id
+            (merge plan { total-completed: (+ (get total-completed plan) u1) })
+        )
+
+        (var-set total-plans-completed (+ (var-get total-plans-completed) u1))
+        (var-set total-rewards-distributed
+            (+ (var-get total-rewards-distributed) (get completion-reward plan))
+        )
+        (ok (get completion-reward plan))
+    )
+)
+
+(define-read-only (get-wellness-plan (plan-id uint))
+    (map-get? wellness-plans plan-id)
+)
+
+(define-read-only (get-user-plan-enrollment
+        (user principal)
+        (plan-id uint)
+    )
+    (map-get? user-plan-enrollments {
+        user: user,
+        plan-id: plan-id,
+    })
+)
+
+(define-read-only (get-plan-daily-progress
+        (user principal)
+        (plan-id uint)
+        (day uint)
+    )
+    (map-get? plan-daily-progress {
+        user: user,
+        plan-id: plan-id,
+        day: day,
+    })
+)
+
+(define-read-only (get-wellness-plan-stats)
+    {
+        total-plans: (var-get wellness-plan-counter),
+        total-plans-completed: (var-get total-plans-completed),
+    }
 )
