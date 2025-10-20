@@ -19,6 +19,15 @@
 (define-constant ERR-MILESTONE-NOT-FOUND (err u117))
 (define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u118))
 (define-constant ERR-INVALID-PLAN-DURATION (err u119))
+(define-constant ERR-CHALLENGE-NOT-FOUND (err u120))
+(define-constant ERR-CHALLENGE-EXPIRED (err u121))
+(define-constant ERR-CHALLENGE-NOT-STARTED (err u122))
+(define-constant ERR-CHALLENGE-ACTIVE (err u123))
+(define-constant ERR-ALREADY-JOINED-CHALLENGE (err u124))
+(define-constant ERR-NOT-CHALLENGE-PARTICIPANT (err u125))
+(define-constant ERR-CHALLENGE-ALREADY-COMPLETED (err u126))
+(define-constant ERR-INVALID-CHALLENGE-DURATION (err u127))
+(define-constant ERR-INVALID-REWARD-DISTRIBUTION (err u128))
 
 (define-constant REWARD-TOKEN-NAME "Wellness Token")
 (define-constant REWARD-TOKEN-SYMBOL "WELL")
@@ -41,6 +50,8 @@
 (define-data-var total-rewards-distributed uint u0)
 (define-data-var wellness-plan-counter uint u0)
 (define-data-var total-plans-completed uint u0)
+(define-data-var social-challenge-counter uint u0)
+(define-data-var total-challenges-completed uint u0)
 
 (define-map user-profiles
     principal
@@ -155,6 +166,54 @@
         exercise-achieved: uint,
         goal-met: bool,
         milestone-claimed: bool,
+    }
+)
+
+(define-map social-challenges
+    uint
+    {
+        title: (string-ascii 100),
+        description: (string-ascii 300),
+        creator: principal,
+        start-day: uint,
+        duration-days: uint,
+        end-day: uint,
+        entry-fee: uint,
+        goal-type: (string-ascii 20),
+        goal-value: uint,
+        reward-distribution: uint,
+        total-pool: uint,
+        participant-count: uint,
+        max-participants: uint,
+        status: (string-ascii 20),
+        winner: (optional principal),
+        completed: bool,
+    }
+)
+
+(define-map challenge-participants
+    {
+        challenge-id: uint,
+        participant: principal,
+    }
+    {
+        joined-day: uint,
+        current-progress: uint,
+        final-progress: uint,
+        rank: uint,
+        reward-claimed: uint,
+    }
+)
+
+(define-map challenge-daily-progress
+    {
+        challenge-id: uint,
+        participant: principal,
+        day: uint,
+    }
+    {
+        progress-value: uint,
+        logged-at: uint,
     }
 )
 
@@ -895,5 +954,237 @@
     {
         total-plans: (var-get wellness-plan-counter),
         total-plans-completed: (var-get total-plans-completed),
+    }
+)
+
+;; Social Challenges Functions
+
+(define-public (create-social-challenge
+        (title (string-ascii 100))
+        (description (string-ascii 300))
+        (duration-days uint)
+        (entry-fee uint)
+        (goal-type (string-ascii 20))
+        (goal-value uint)
+        (reward-distribution uint)
+        (max-participants uint)
+    )
+    (let (
+            (challenge-id (+ (var-get social-challenge-counter) u1))
+            (current-day (get-current-day))
+            (end-day (+ current-day duration-days))
+        )
+        (asserts! (> duration-days u0) ERR-INVALID-CHALLENGE-DURATION)
+        (asserts! (<= duration-days u30) ERR-INVALID-CHALLENGE-DURATION)
+        (asserts! (> entry-fee u0) ERR-INVALID-AMOUNT)
+        (asserts! (> goal-value u0) ERR-INVALID-ACTIVITY)
+        (asserts! (> max-participants u1) ERR-INVALID-AMOUNT)
+        (asserts! (<= max-participants u100) ERR-INVALID-AMOUNT)
+        (asserts! (>= reward-distribution u1) ERR-INVALID-REWARD-DISTRIBUTION)
+        (asserts! (<= reward-distribution u3) ERR-INVALID-REWARD-DISTRIBUTION)
+
+        (map-set social-challenges challenge-id {
+            title: title,
+            description: description,
+            creator: tx-sender,
+            start-day: (+ current-day u1),
+            duration-days: duration-days,
+            end-day: end-day,
+            entry-fee: entry-fee,
+            goal-type: goal-type,
+            goal-value: goal-value,
+            reward-distribution: reward-distribution,
+            total-pool: u0,
+            participant-count: u0,
+            max-participants: max-participants,
+            status: "open",
+            winner: none,
+            completed: false,
+        })
+
+        (var-set social-challenge-counter challenge-id)
+        (ok challenge-id)
+    )
+)
+
+(define-public (join-social-challenge (challenge-id uint))
+    (let (
+            (challenge (unwrap! (map-get? social-challenges challenge-id)
+                ERR-CHALLENGE-NOT-FOUND
+            ))
+            (current-day (get-current-day))
+            (existing-participation (map-get? challenge-participants {
+                challenge-id: challenge-id,
+                participant: tx-sender,
+            }))
+        )
+        (asserts! (is-none existing-participation) ERR-ALREADY-JOINED-CHALLENGE)
+        (asserts! (< current-day (get start-day challenge)) ERR-CHALLENGE-NOT-STARTED)
+        (asserts! (< (get participant-count challenge) (get max-participants challenge))
+            ERR-DAILY-LIMIT-REACHED
+        )
+        (asserts! (>= (ft-get-balance wellness-token tx-sender) (get entry-fee challenge))
+            ERR-INSUFFICIENT-FUNDS
+        )
+
+        (try! (ft-transfer? wellness-token (get entry-fee challenge) tx-sender
+            (get creator challenge)
+        ))
+
+        (map-set challenge-participants {
+            challenge-id: challenge-id,
+            participant: tx-sender,
+        } {
+            joined-day: current-day,
+            current-progress: u0,
+            final-progress: u0,
+            rank: u0,
+            reward-claimed: u0,
+        })
+
+        (map-set social-challenges challenge-id
+            (merge challenge {
+                total-pool: (+ (get total-pool challenge) (get entry-fee challenge)),
+                participant-count: (+ (get participant-count challenge) u1),
+                status: (if (is-eq (+ (get participant-count challenge) u1)
+                        (get max-participants challenge)
+                    )
+                    "full"
+                    "open"
+                ),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (log-challenge-progress
+        (challenge-id uint)
+        (progress-value uint)
+    )
+    (let (
+            (challenge (unwrap! (map-get? social-challenges challenge-id)
+                ERR-CHALLENGE-NOT-FOUND
+            ))
+            (current-day (get-current-day))
+            (participation (unwrap!
+                (map-get? challenge-participants {
+                    challenge-id: challenge-id,
+                    participant: tx-sender,
+                })
+                ERR-NOT-CHALLENGE-PARTICIPANT
+            ))
+            (existing-progress (map-get? challenge-daily-progress {
+                challenge-id: challenge-id,
+                participant: tx-sender,
+                day: current-day,
+            }))
+        )
+        (asserts! (>= current-day (get start-day challenge)) ERR-CHALLENGE-NOT-STARTED)
+        (asserts! (< current-day (get end-day challenge)) ERR-CHALLENGE-EXPIRED)
+        (asserts! (> progress-value u0) ERR-INVALID-ACTIVITY)
+        (asserts! (is-none existing-progress) ERR-DAILY-LIMIT-REACHED)
+
+        (map-set challenge-daily-progress {
+            challenge-id: challenge-id,
+            participant: tx-sender,
+            day: current-day,
+        } {
+            progress-value: progress-value,
+            logged-at: current-day,
+        })
+
+        (map-set challenge-participants {
+            challenge-id: challenge-id,
+            participant: tx-sender,
+        }
+            (merge participation {
+                current-progress: (+ (get current-progress participation) progress-value),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (complete-social-challenge (challenge-id uint))
+    (let (
+            (challenge (unwrap! (map-get? social-challenges challenge-id)
+                ERR-CHALLENGE-NOT-FOUND
+            ))
+            (current-day (get-current-day))
+        )
+        (asserts! (>= current-day (get end-day challenge)) ERR-CHALLENGE-ACTIVE)
+        (asserts! (not (get completed challenge)) ERR-CHALLENGE-ALREADY-COMPLETED)
+        (asserts! (> (get participant-count challenge) u0) ERR-NOT-FOUND)
+
+        (let ((winner (get-challenge-winner challenge-id)))
+            (match winner
+                winner-principal
+                (begin
+                    (try! (ft-mint? wellness-token (get total-pool challenge) winner-principal))
+                    (map-set social-challenges challenge-id
+                        (merge challenge {
+                            status: "completed",
+                            winner: (some winner-principal),
+                            completed: true,
+                        })
+                    )
+                )
+                (map-set social-challenges challenge-id
+                    (merge challenge {
+                        status: "completed",
+                        winner: none,
+                        completed: true,
+                    })
+                )
+            )
+        )
+
+        (var-set total-challenges-completed (+ (var-get total-challenges-completed) u1))
+        (ok true)
+    )
+)
+
+(define-read-only (get-challenge-winner (challenge-id uint))
+    (let (
+            (challenge (unwrap! (map-get? social-challenges challenge-id) none))
+        )
+        (if (> (get participant-count challenge) u0)
+            (some (get creator challenge))
+            none
+        )
+    )
+)
+
+(define-read-only (get-social-challenge-details (challenge-id uint))
+    (map-get? social-challenges challenge-id)
+)
+
+(define-read-only (get-challenge-participant-info
+        (challenge-id uint)
+        (participant principal)
+    )
+    (map-get? challenge-participants {
+        challenge-id: challenge-id,
+        participant: participant,
+    })
+)
+
+(define-read-only (get-challenge-daily-progress
+        (challenge-id uint)
+        (participant principal)
+        (day uint)
+    )
+    (map-get? challenge-daily-progress {
+        challenge-id: challenge-id,
+        participant: participant,
+        day: day,
+    })
+)
+
+(define-read-only (get-social-challenge-stats)
+    {
+        total-challenges: (var-get social-challenge-counter),
+        total-completed: (var-get total-challenges-completed),
     }
 )
