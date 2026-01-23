@@ -62,6 +62,6 @@ plan:
         - emulated-contract-publish:
             contract-name: Crypto-Wellness-Rewards
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: "contracts\\Crypto-Wellness-Rewards.clar"
+            path: contracts/Crypto-Wellness-Rewards.clar
             clarity-version: 3
-      epoch: "3.1"
+      epoch: "3.0"
